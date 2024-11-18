@@ -1,3 +1,4 @@
+-- visitor_id с последней даты с неорганики
 WITH last_paid AS (
     SELECT
         visitor_id,
@@ -6,78 +7,39 @@ WITH last_paid AS (
     WHERE medium IN ('cpc', 'cpm', 'cpa', 'youtube', 'cpp', 'tg', 'social')
     GROUP BY 1
 ),
-
-last_visit AS (
+-- подтягиваем их метки из начальной таблицы
+-- крепим данные лидов
+-- группируем для итоговой таблицы
+leads_tab AS (
     SELECT
-        s.visitor_id,
-        source,
-        medium,
-        campaign,
-        s.visit_date,
-        max_paid_date
-    FROM sessions AS s
-    LEFT JOIN last_paid ON s.visitor_id = last_paid.visitor_id
-    WHERE max_paid_date = s.visit_date
-),
-
-lpt AS (
-    SELECT
-        leads.visitor_id,
-        max_paid_date AS visit_date,
+        date_trunc('day', max_paid_date) AS visit_date,
         source AS utm_source,
         medium AS utm_medium,
         campaign AS utm_campaign,
-        lead_id,
-        created_at,
-        amount,
-        closing_reason,
-        status_id
-    FROM leads LEFT JOIN last_visit ON leads.visitor_id = last_visit.visitor_id
-    WHERE source IS NOT null
-    ORDER BY
-        amount DESC NULLS LAST,
-        visit_date ASC,
-        utm_source ASC,
-        utm_medium ASC,
-        utm_campaign ASC
-),
-
-leads_tab AS (
-    SELECT
-        utm_source,
-        utm_medium,
-        utm_campaign,
-        date_trunc('day', visit_date) AS visit_date,
         count(lead_id) AS leads_count,
+        count(distinct s.visitor_id) AS visitors_count,
         count(
-            CASE WHEN closing_reason = 'Успешная продажа' THEN 1 END
+            CASE
+                WHEN
+                    closing_reason = 'Успешная продажа' OR status_id = 142
+                    THEN leads.visitor_id
+            END
         ) AS purchases_count,
         sum(coalesce(amount, 0)) AS revenue
-    FROM lpt
+    FROM sessions AS s
+    LEFT JOIN last_paid
+        ON
+            s.visitor_id = last_paid.visitor_id
+            AND s.visit_date = last_paid.max_paid_date
+    LEFT JOIN leads
+        ON
+            last_paid.visitor_id = leads.visitor_id
+            AND leads.created_at >= visit_date
+    WHERE source IS NOT null
     GROUP BY
-        date_trunc('day', visit_date),
-        utm_source,
-        utm_medium,
-        utm_campaign
+        1, 2, 3, 4
     ORDER BY visit_date ASC
 ),
-
-ss_tab AS (
-    SELECT
-        sessions.source AS utm_source,
-        sessions.medium AS utm_medium,
-        sessions.campaign AS utm_campaign,
-        date_trunc('day', sessions.visit_date) AS visit_date,
-        count(sessions.visitor_id) AS visitors_count
-    FROM sessions
-    GROUP BY
-        date_trunc('day', sessions.visit_date),
-        utm_source,
-        utm_medium,
-        utm_campaign
-    ORDER BY visit_date ASC
-),
-
 ads_tab AS (
     SELECT
         date(campaign_date) AS campaign_date,
@@ -97,33 +59,24 @@ ads_tab AS (
     FROM ya_ads
     GROUP BY 1, 2, 3, 4
 ),
-
--- Собираем все данные в одну таблицу
 refined_data AS (
     select
-        to_char(ss_tab.visit_date, 'YYYY-MM-DD') AS visit_date
-        ss_tab.visitors_count,
-        ss_tab.utm_source,
-        ss_tab.utm_medium,
-        ss_tab.utm_campaign,
+        date(leads_tab.visit_date) AS visit_date,
+        leads_tab.visitors_count,
+        leads_tab.utm_source,
+        leads_tab.utm_medium,
+        leads_tab.utm_campaign,
         ads_tab.cost AS total_cost,
         leads_count,
         purchases_count,
-        revenue
-        
-    FROM ss_tab
+        revenue  
+    FROM leads_tab
     FULL OUTER JOIN ads_tab
         ON
-            ss_tab.utm_source = ads_tab.utm_source
-            AND ss_tab.utm_medium = ads_tab.utm_medium
-            AND ss_tab.utm_campaign = ads_tab.utm_campaign
-            AND ss_tab.visit_date = ads_tab.campaign_date
-    FULL OUTER JOIN leads_tab
-        ON
-            ss_tab.utm_source = leads_tab.utm_source
-            AND ss_tab.utm_medium = leads_tab.utm_medium
-            AND ss_tab.utm_campaign = leads_tab.utm_campaign
-            AND ss_tab.visit_date = leads_tab.visit_date
+            leads_tab.utm_source = ads_tab.utm_source
+            AND leads_tab.utm_medium = ads_tab.utm_medium
+            AND leads_tab.utm_campaign = ads_tab.utm_campaign
+            AND leads_tab.visit_date = ads_tab.campaign_date
     ORDER BY
         revenue DESC NULLS LAST,
         visit_date ASC,
@@ -133,5 +86,4 @@ refined_data AS (
         utm_campaign ASC
     LIMIT 15
 )
-
 SELECT * FROM refined_data;
