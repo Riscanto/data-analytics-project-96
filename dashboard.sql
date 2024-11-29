@@ -1,112 +1,42 @@
+--DASHBOARD
 WITH last_paid AS (
     SELECT
         visitor_id,
         max(visit_date) AS max_paid_date
     FROM sessions
-    WHERE medium != 'organic'
+    WHERE medium IN ('cpc', 'cpm', 'cpa', 'youtube', 'cpp', 'tg', 'social')
     GROUP BY 1
 ),
--- Дата последнего захода. Потом использую чтобы можно было и органику тоже отслеживать. Где не нужно - уберу.
-last_date AS (
-    SELECT
-        visitor_id,
-        max(visit_date) AS max_date
-    FROM sessions
-    GROUP BY 1
-),
--- Промежуточная таблица, подбор дат последнего захода к visitor_id.
--- Последняя дата - дата последнего захода с неорганики. Если такого нет, то последнего с органики.
-max_visit_date AS (
-    SELECT
-        s.visitor_id,
-        source,
-        medium,
-        campaign,
-        s.visit_date,
-        (coalesce (max_paid_date, max_date)) AS max_v_date
-    FROM sessions AS s
-    LEFT JOIN last_paid USING (visitor_id)
-LEFT JOIN last_date USING (visitor_id)
-),
--- Отфильтруем, оставим по 1 записи на каждого visitor_id с датой последнего захода и сопутствующими метками.
-last_visit AS (
-SELECT *
-FROM max_visit_date
-WHERE max_v_date = visit_date
-ORDER BY visitor_id
-),
--- Структура лидов по меткам:
--- Теперь крепим к лидам записи visitor_id с метками и датой последнего захода
-leads_structure AS (
-SELECT
-    leads.visitor_id,
-    lead_id,
-    amount,
-    created_at,
-    closing_reason,
-    status_id,
-    source AS utm_source,
-    medium AS utm_medium,
-    campaign AS utm_campaign,
-    max_v_date,
-    (created_at - max_v_date) AS close_time
-FROM leads LEFT JOIN last_visit ON leads.visitor_id = last_visit.visitor_id
-ORDER BY lead_id
-),
---Отдельная табличка чтобы посмотеть какими темпами закрываются лиды, close_time
-ct AS (
-SELECT
-*,
-row_number() OVER (ORDER BY close_time ASC) AS rn
-FROM leads_structure
-WHERE close_time IS NOT null
-),
--- Отберём запись, соответствующую уровню 90 из 100 
-ct2 AS (
-SELECT
-close_time,
-rn
-FROM ct WHERE rn = (SELECT (max(rn) * 90 / 100) AS p FROM ct)
-),
--- Обобщаем данные посещений сайта по датам и меткам
-ss_tab AS (
-SELECT
-sessions.source AS utm_source,
-sessions.medium AS utm_medium,
-sessions.campaign AS utm_campaign,
-date_trunc('day', sessions.visit_date) AS visit_date,
-count(sessions.visitor_id) AS visitors_count
-FROM sessions
-GROUP BY
-date_trunc('day', sessions.visit_date), utm_source, utm_medium, utm_campaign
-ORDER BY visit_date ASC
-),
---Обобщаем лидов по датам и меткам. В основе - таблица сессий, к ней крепим данные лидов. 
---Собираем итоги visitors_count, leads_count, purchases_count, revenue с разбивкой по датам и меткам.
 leads_tab AS (
-SELECT
-l_a.utm_source,
-l_a.utm_medium,
-l_a.utm_campaign,
-date_trunc('day', sessions.visit_date) AS visit_date,
-count(sessions.visitor_id) AS visitors_count,
-count(lead_id) AS leads_count,
-count(
-    CASE WHEN closing_reason = 'Успешная продажа' THEN 1 END
-) AS purchases_count,
-sum(coalesce(amount, 0)) AS revenue
-FROM sessions
-LEFT JOIN
-leads_structure AS l_a
-ON sessions.visitor_id = l_a.visitor_id AND sessions.visit_date = l_a.max_v_date
-GROUP BY
-date_trunc('day', sessions.visit_date),
-l_a.utm_source,
-l_a.utm_medium,
-l_a.utm_campaign
-ORDER BY visit_date ASC
+    select
+        date(max_paid_date) AS visit_date,
+        source AS utm_source,
+        medium AS utm_medium,
+        campaign AS utm_campaign,
+        count(lead_id) AS leads_count,
+        count(distinct s.visitor_id) AS visitors_count,
+        count(
+            CASE
+                WHEN
+                    closing_reason = 'Успешная продажа' OR status_id = 142
+                    THEN leads.visitor_id
+            END
+        ) AS purchases_count,
+        sum(coalesce(amount, 0)) AS revenue
+    FROM last_paid
+    INNER JOIN sessions s
+        ON
+            s.visitor_id = last_paid.visitor_id
+            AND s.visit_date = last_paid.max_paid_date
+    LEFT JOIN leads
+        ON
+            last_paid.visitor_id = leads.visitor_id
+            AND leads.created_at >= last_paid.max_paid_date
+    WHERE source IS NOT null
+    GROUP BY
+        1, 2, 3, 4
+    ORDER BY visit_date ASC
 ),
--- Обобщаем расходы на рекламные кампании по датам и меткам
 ads_tab AS (
 SELECT
 date(campaign_date) AS campaign_date,
@@ -127,80 +57,54 @@ FROM ya_ads
 GROUP BY 1, 2, 3, 4
 ),
 -- Собираем все данные в одну таблицу, дальше будем только агрегировать в несколько шагов
+--Здесь у нас группированные данные, включая группировку по датам, для анализа.
 refined_data AS (
 SELECT
-ss_tab.visit_date AS ss_visit_date,
-ss_tab.utm_source AS ss_source,
-ss_tab.utm_medium AS ss_medium,
-ss_tab.utm_campaign AS ss_campaign,
-ss_tab.visitors_count AS ss_visitors,
-leads_tab.visit_date AS leads_visit_date,
-leads_tab.utm_source AS l_utm_source,
-leads_tab.utm_medium AS l_utm_medium,
-leads_tab.utm_campaign AS l_utm_campaign,
+leads_tab.visit_date AS visit_date,
+leads_tab.utm_source AS utm_source,
+leads_tab.utm_medium AS utm_medium,
+leads_tab.utm_campaign AS utm_campaign,
+visitors_count,
 leads_count,
 purchases_count,
 revenue,
-ads_tab.cost,
-ads_tab.campaign_date AS ads_campaign_date,
-ads_tab.utm_source AS ads_utm_source,
-ads_tab.utm_medium AS ads_utm_medium,
-ads_tab.utm_campaign AS ads_utm_campaign
-FROM ss_tab
-FULL OUTER JOIN ads_tab
+ads_tab.cost
+FROM leads_tab
+LEFT JOIN ads_tab
 ON
-    ss_tab.utm_source = ads_tab.utm_source
-    AND ss_tab.utm_medium = ads_tab.utm_medium
-    AND ss_tab.utm_campaign = ads_tab.utm_campaign
-    AND ss_tab.visit_date = ads_tab.campaign_date
-FULL OUTER JOIN leads_tab
-ON
-    ss_tab.utm_source = leads_tab.utm_source
-    AND ss_tab.utm_medium = leads_tab.utm_medium
-    AND ss_tab.utm_campaign = leads_tab.utm_campaign
-    AND ss_tab.visit_date = leads_tab.visit_date
-ORDER BY ss_tab.visit_date ASC, ads_tab.campaign_date DESC NULLS LAST
-),
--- таблица для расчёта корреляции
-corr_data AS (
-SELECT
-ss_visit_date,
-sum(ss_visitors) AS sum_v,
-sum(coalesce(cost, 0))
-FROM refined_data
-GROUP BY ss_visit_date
-ORDER BY ss_visit_date
-),
-cr AS (
-SELECT
-corr(corr_data.sum_v, corr_data.sum) AS correlation_0,
-corr(cd.sum_v, corr_data.sum) AS correlation_1
-FROM corr_data
-LEFT JOIN
-corr_data AS cd
-ON corr_data.ss_visit_date = (cd.ss_visit_date + interval '1 day')
+    leads_tab.utm_source = ads_tab.utm_source
+    AND leads_tab.utm_medium = ads_tab.utm_medium
+    AND leads_tab.utm_campaign = ads_tab.utm_campaign
+    AND leads_tab.visit_date = ads_tab.campaign_date
+    ORDER BY
+        revenue DESC NULLS LAST,
+        1 ASC,
+        5 DESC,
+        2 ASC,
+        3 ASC,
+        4 ASC
 ),
 --Агрегируем данные по метрикам, опуская даты для итоговых расчётов в дашборде
-ads_metrics AS (
+a_metrics AS (
 SELECT
-ss_source,
-ss_medium,
-ss_campaign,
-sum(coalesce(ss_visitors, 0)) AS visitors_count,
+utm_source source,
+utm_medium medium,
+utm_campaign campaign,
+sum(coalesce(visitors_count, 0)) AS visitors_count,
 sum(coalesce(leads_count, 0)) AS leads_count,
 sum(coalesce(purchases_count, 0)) AS purchases_count,
 sum(coalesce(revenue, 0)) AS revenue_sum,
 sum(coalesce(cost, 0)) AS total_cost_sum
 FROM refined_data
 GROUP BY
-ss_source, ss_medium, ss_campaign
+1, 2, 3
 ORDER BY leads_count DESC
 ),
 dashboard AS (
 SELECT
-ss_source AS source,
-ss_medium AS medium,
-ss_campaign AS campaign,
+source,
+medium,
+campaign,
 visitors_count,
 leads_count,
 purchases_count,
@@ -228,8 +132,55 @@ total_cost_sum,
             THEN ((revenue_sum - total_cost_sum) / (total_cost_sum))
         END
     ) AS roi
-FROM ads_metrics
-WHERE total_cost_sum != 0
+FROM a_metrics
 ORDER BY roi DESC NULLS LAST
+),
+leads_structure AS (
+SELECT
+    leads.visitor_id,
+    max_paid_date visit_date,
+    lead_id,
+    created_at,
+    (created_at - max_paid_date) AS close_time,
+    row_number() OVER (ORDER BY 8 asc) AS rn
+FROM leads LEFT JOIN last_paid ON leads.visitor_id = last_paid.visitor_id
+WHERE max_paid_date IS NOT null and max_paid_date <= created_at
+ORDER BY lead_id
+),
+--Отдельная табличка чтобы посмотеть какими темпами закрываются лиды, close_time
+-- Отберём запись, соответствующую уровню 90 из 100 
+ct AS (
+SELECT
+close_time,
+rn
+FROM leads_structure WHERE rn = (SELECT (max(rn) * 90 / 100) AS p FROM leads_structure)
+),
+organic_visits as (
+select 
+date(visit_date) AS visit_date,
+        count(distinct s.visitor_id) AS visitors_count
+        from sessions s
+        where medium = 'organic'
+        group by 1
+        ),
+-- таблица для расчёта корреляции
+corr_data AS (
+select
+date(visit_date) AS visit_date,
+        visitors_count,
+sum(cost) as cost
+FROM organic_visits full join ads_tab on ads_tab.campaign_date = organic_visits.visit_date
+GROUP BY 1, 2
+ORDER BY 1
+),
+cr AS (
+SELECT
+corr(corr_data.visitors_count, corr_data.cost) AS correlation_0,
+corr(cd.visitors_count, corr_data.cost) AS correlation_1
+FROM corr_data
+LEFT JOIN
+corr_data AS cd
+ON corr_data.visit_date = (cd.visit_date + interval '1 day')
 )
 SELECT * FROM dashboard
+;
